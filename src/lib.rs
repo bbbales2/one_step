@@ -1,26 +1,41 @@
-//use numpy::PyArray1;
-use pyo3::prelude::{PyResult, Python};
-use pyo3::types::{PyDict, IntoPyDict};
-use std::collections::HashMap;
-//use pyo3::conversion::{ToPyObject, IntoPy};
-//use ndarray::prelude::*;
 
-fn uturn(q_plus: &Vec<f64>, q_minus: &Vec<f64>, p_plus: &Vec<f64>, p_minus: &Vec<f64>) -> bool {
-    let uturn_forward = itertools::izip!(p_plus, q_plus, q_minus).map(|(p_plus_e, q_plus_e, q_minus_e)| p_plus_e * (q_plus_e - q_minus_e)).sum::<f64>() <= 0.0;
-    let uturn_backward = itertools::izip!(p_minus, q_plus, q_minus).map(|(p_minus_e, q_plus_e, q_minus_e)| -p_minus_e * (q_minus_e - q_plus_e)).sum::<f64>() <= 0.0;
+use pyo3::prelude::*;
+use pyo3::prelude::{PyResult, Python, PyObject};
+use pyo3::types::{PyDict, IntoPyDict, PyTuple};
+use pyo3::conversion::ToPyObject;
+use std::collections::HashMap;
+use ndarray::*;
+use ndarray::prelude::*;
+use numpy::{IntoPyArray, PyArrayDyn, PyReadonlyArray1};
+use std::iter::FromIterator;
+use numpy::ToPyArray;
+use pyo3::{pymodule, types::PyModule};
+
+fn uturn(q_plus: &ArrayView1<f64>, q_minus: &ArrayView1<f64>, p_plus: &ArrayView1<f64>, p_minus: &ArrayView1<f64>) -> bool {
+    let uturn_forward = (q_plus - q_minus).dot(p_plus) <= 0.0;
+    let uturn_backward = -(q_minus - q_plus).dot(p_minus) <= 0.0;
+
+    //let uturn_forward = itertools::izip!(p_plus, q_plus, q_minus).map(|(p_plus_e, q_plus_e, q_minus_e)| p_plus_e * (q_plus_e - q_minus_e)).sum::<f64>() <= 0.0;
+    //let uturn_backward = itertools::izip!(p_minus, q_plus, q_minus).map(|(p_minus_e, q_plus_e, q_minus_e)| -p_minus_e * (q_minus_e - q_plus_e)).sum::<f64>() <= 0.0;
 
     uturn_forward && uturn_backward
 }
 
-fn kinetic_energy(p : &Vec<f64>, diag_m_inv : &Vec<f64>) -> f64 {
-    let sum : f64 = p.iter().zip(diag_m_inv.iter()).map(|(x, m_inv)| x * x * m_inv).sum();
-    0.5 * sum
+fn kinetic_energy(p : &Array1<f64>, diag_m_inv : &Array1<f64>) -> f64 {
+    0.5 * (p * diag_m_inv).dot(p)
 }
 
-fn value_and_grad(q : &Vec<f64>) -> (f64, Vec<f64>) {
-    let sum : f64 = q.iter().map(|x| x * x).sum();
-    
-    (0.5 * sum, q.clone())
+// fn value_and_grad(q : &Array1<f64>) -> (f64, Array1<f64>) {
+//     let result = Python::with_gil(|py| -> PyResult<()> {
+        
+//         Ok(())
+//     });
+
+//     (0.5 * q.dot(q), q.clone())
+// }
+
+fn value_and_grad2(q : &Array1<f64>) -> (f64, Array1<f64>) {
+    (0.5 * q.dot(q), q.clone())
 }
 
 fn log_sum_exp(x : &Vec<f64>) -> f64 {
@@ -32,88 +47,84 @@ fn softmax(x : &Vec<f64>) -> Vec<f64>{
     Vec::from_iter(x.iter().map(|xv| (xv - log_sum_exp(x)).exp()))
 }
 
-fn main() -> PyResult<()> {
-    Python::with_gil(|py| {
-        let locals = PyDict::new(py);
-        py.run(
-            r#"
-import numpy
-rng = numpy.random.default_rng(seed = 1)
-current_draw = numpy.zeros(2)
-stepsize = 0.05
-diagonal_inverse_metric = numpy.array([0.3, 1.7])
-max_treedepth = 10
-"#,
-            None,
-            Some(locals),
-        )
-        .unwrap();
+#[pyfunction]
+fn do_it<'py>(
+    py: Python<'py>,
+    py_value_and_grad : PyObject,
+    py_rng : PyObject,
+    py_q0 : PyReadonlyArray1<f64>,
+    py_diagonal_inverse_metric : PyReadonlyArray1<f64>,
+    stepsize : f64,
+    max_treedepth : usize
+) -> PyResult<Vec<PyObject>> {
+    let q0 = py_q0.as_array().to_owned();
+    let diag_m_inv = py_diagonal_inverse_metric.as_array().to_owned();
 
-        let py_rng = locals.get_item("rng").unwrap();
+    let size = q0.len();
+    let kwargs = [("size", size)].into_py_dict(py);
+    let z : Array1<f64> = Array1::from_vec(py_rng.call_method(py, "normal", (), Some(kwargs)).unwrap().extract(py)?);
+    let kwargs = [("low", 0), ("high", 2), ("size", max_treedepth + 1)].into_py_dict(py);
+    let directions : Vec<i32> = py_rng.call_method(py, "integers", (), Some(kwargs)).unwrap().extract(py)?;
+    let kwargs = [("size", max_treedepth)].into_py_dict(py);
+    let choice_draws : Vec<f64> = py_rng.call_method(py, "random", (), Some(kwargs)).unwrap().extract(py)?;
+    let pick_draws : Vec<f64> = py_rng.call_method(py, "random", (), Some(kwargs)).unwrap().extract(py)?;
 
-        let max_treedepth : usize = locals.get_item("max_treedepth").unwrap().extract()?;
-        let stepsize : f64 = locals.get_item("stepsize").unwrap().extract()?;
-        let q0 : Vec<f64> = locals.get_item("current_draw").unwrap().extract()?;
-        let diag_m_inv : Vec<f64> = locals.get_item("diagonal_inverse_metric").unwrap().extract()?;
 
-        let size = q0.len();
-        let z : Vec<f64> = py_rng.call_method1("normal", (0.0, 1.0, size)).unwrap().extract()?;
-        let directions : Vec<i32> = py_rng.call_method1("integers", (0, 2, max_treedepth + 1)).unwrap().extract()?;
-        let kwargs = [("size", max_treedepth)].into_py_dict(py);
-        let choice_draws : Vec<f64> = py_rng.call_method("random", (), Some(kwargs)).unwrap().extract()?;
-        let pick_draws : Vec<f64> = py_rng.call_method("random", (), Some(kwargs)).unwrap().extract()?;
+    fn value_and_grad(py: Python, py_value_and_grad: &PyObject, q : &Array1<f64>) -> (f64, Array1<f64>) {
+        let kwargs = [("q0", q.to_pyarray(py))].into_py_dict(py);
+        let res = py_value_and_grad.call(py, (), Some(kwargs)).unwrap().extract(py);
+        let (u, grad_intermediate) : (f64, Vec<f64>) = match res {
+            Ok(v) => v,
+            Err(e) => (0.0, Vec::new())
+        };
+        (u, Array1::from_vec(grad_intermediate))
+    }
 
-        //let q0 = Array1::from_iter(q0_vec);
-        //let diag_m_inv = Array1::from_iter(diag_m_inv_vec);
-        //let z = Array1::from_iter(z_vec);
-        let p0 = Vec::from_iter(z.iter().zip(diag_m_inv.iter()).map(|(z, m_inv)| z / m_inv.sqrt()));
+    // Allocate return values
+    let mut q_ret = Array1::zeros(size);
+    let mut accept_stat : Option<f64> = None;
+    let mut total_leapfrogs_taken = 0;
 
-        let (u0, grad0) = value_and_grad(&q0);
+    // Apparently using as for the conversion is kinda bad cause it can mess up
+    let max_leapfrogs : usize = 2_usize.pow(max_treedepth as u32);
+
+    // To compute the U-turn conditions, we need to save our positions/momentums
+    // Technically we only need to save the new subtree we computed, but to avoid
+    // a bunch of mallocs we just save the whole trajectory
+
+    // qs stores our positions
+    let mut qs = Array2::zeros((max_leapfrogs, size));
+    // ps stores our momentums
+    let mut ps = Array2::zeros((max_leapfrogs, size));
+
+    py.allow_threads(||{
+        let p0 = z / diag_m_inv.mapv(|x : f64| x.sqrt());//Vec::from_iter(z.iter().zip(diag_m_inv.iter()).map(|(z, m_inv)| z / m_inv.sqrt()));
+
+        let (u0, _) = Python::with_gil(|py| {
+            value_and_grad(py, &py_value_and_grad, &q0)
+        });
         let h0 = kinetic_energy(&p0, &diag_m_inv) + u0;
 
         // directions is a length max_treedepth vector that maps each treedepth
         //  to an integration direction (left or right)
         let directions : Vec<i32> = Vec::from_iter(directions.iter().map(|d| if *d == 0 {-1} else {1}));
-        
-        // depth_map will be a vector of length 2^max_treedepth that maps each of
-        //  the possibly 2^max_treedepth points to a treedepth
-        let mut depth_map = vec![0];
-        for depth in 1..(max_treedepth + 1) {
-            let direction = directions[depth];
-
-            let mut new_section = vec![depth; depth_map.len()];
-
+            
+        // Compute the position of the initial condition in the trajectory
+        let mut i_first = 0;
+        for (depth, &direction) in directions[1..].iter().enumerate() {
             if direction < 0 {
-                new_section.append(&mut depth_map);
-                depth_map = new_section;
-            } else {
-                depth_map.append(&mut new_section);
+                i_first = i_first + (1 << depth);
             }
         }
 
-        // Steps is a dict that maps treedepth to which leapfrog steps were
-        //  computed in that treedepth (kinda the opposite of depth_map)
-        let mut steps : HashMap<usize, Vec<usize>> = HashMap::new();
-
-        // Apparently using as for the conversion is kinda bad cause it can mess up
-        let max_leapfrogs : usize = 2_usize.pow(max_treedepth as u32);
-
-        // qs stores our positions
-        let mut qs = vec![vec![0_f64; size]; max_leapfrogs];
-        // ps stores our momentums
-        let mut ps = vec![vec![0_f64; size]; max_leapfrogs];
-
         // log_pi defined in section A.2.3 of https://arxiv.org/abs/1701.02434
         let mut log_pi = vec![0_f64; max_leapfrogs];
-        // index of initial state
-        let (i_first, _) = depth_map.iter().enumerate().find(|(pos, &d)| d == 0).unwrap();
 
-        qs[i_first] = q0;
-        ps[i_first] = p0;
+        qs.row_mut(i_first).assign(&q0);
+        ps.row_mut(i_first).assign(&p0);
         log_pi[i_first] = -h0;
         
         let mut divergence = false;
-        let mut accept_stat : Option<f64> = None;
         // i_left and i_right are indices that track the leftmost and rightmost
         //  states of the integrated trajectory
         let mut i_left = i_first;
@@ -128,29 +139,30 @@ max_treedepth = 10
         //  hit the max trajectory length
         let mut uturn_detected = false;
         // For trees of increasing treedepth
-
+        
+        let mut checks = Vec::new();
+        checks.reserve(2 << max_treedepth);
         for depth in 1..(max_treedepth + 1) {
             // Figure out what leapfrog steps we need to compute. If integrating in the
             //  positive direction update the index that points at the right side of the
             //  trajectory. If integrating in the negative direction update the index pointing
             //  to the left side of the trajectory.
+            let max_leapfrog_steps = 1 << (depth - 1);
             let depth_steps = if directions[depth] < 0 {
-                Vec::from_iter(depth_map.iter().enumerate().filter_map(|(pos, &d)| if d == depth {Some(pos)} else {None}).rev())
+                Vec::from_iter(((i_left - max_leapfrog_steps)..i_left).rev())
             } else {
-                Vec::from_iter(depth_map.iter().enumerate().filter_map(|(pos, &d)| if d == depth {Some(pos)} else {None}))
+                Vec::from_iter((i_right + 1)..(i_right + 1 + max_leapfrog_steps))
             };
             
+            let i_prev;
             if directions[depth] < 0 {
+                i_prev = i_left;
                 i_left = *depth_steps.last().unwrap();
             } else {
+                i_prev = i_right;
                 i_right = *depth_steps.last().unwrap();
             }
 
-            // Unused except for debugging so I'm getting rid of it
-            // See: https://stackoverflow.com/a/30414450
-            //steps[&depth] = depth_steps
-
-            let mut checks : Vec<(usize, usize)> = Vec::new();
             // What we're doing here is generating a trajectory composed of a number of leapfrog states.
             // We apply a set of comparisons on this trajectory that can be organized to look like a binary tree.
             // Sometimes I say trajectory instead of tree. Each piece of the tree in the comparison corresponds
@@ -164,8 +176,8 @@ max_treedepth = 10
             let mut uturn_detected_new_tree = false;
 
             // Starts and ends are relative because they point to the ith leapfrog step in a sub-trajectory
-            //  of size 2^tree_depth which needs to be mapped to the global index of qs
-            //  (which is defined in the range 1:2^max_treedepth)
+            //  of size 2^(depth - 1) (this is max_leapfrog_steps) which needs to be mapped to the global
+            // index of qs (which is defined in the range 1:2^max_treedepth)
             //
             // We're assuming at this point that depth_steps is in sorted order
             //
@@ -175,22 +187,18 @@ max_treedepth = 10
             // This sort is important because we need to keep track of what is left and what is right
             //  in the trajectory so that we do the right comparisons
             if depth > 1 {
-                // Start at root of new subtree and work down to leaves
-                for uturn_depth in (1..depth).rev() {
-                    // The root of the comparison tree compares the leftmost to the rightmost states of the new
-                    //  part of the trajectory.
-                    //  The next level down in the tree of comparisons cuts that trajectory in two and compares
-                    //  the leftmost and rightmost elements of those smaller trajectories.
-                    //  Etc. Etc.
-                    let div_length = 2_u32.pow(uturn_depth as u32) as usize;
-
-                    // Starts are relative indices pointing to the leftmost state of each comparison to be done
-                    for start in (0..depth_steps.len()).step_by(div_length) {
-                        // Ends are relative indices pointing to the rightmost state for each comparison to be done
-                        let end = start + div_length - 1;
-                        checks.push((start, end));
-                    }
-                }
+                // Each new subtree is twice as wide as the previous. For each half of the new
+                // subtree, we need to do all the checks as the previous subtree, plus one
+                // additional end-to-end check
+                let div_length = max_leapfrog_steps >> 1;
+                // Copy and shift the previous checks
+                checks.extend(
+                    checks.clone().iter().map(|&(x, y)| {
+                        (x + div_length, y + div_length)
+                    })
+                );
+                // And the additional end to end check
+                checks.push((0, 2 * div_length - 1));
             }
 
             // Sort the checks so that we only need to check them in order
@@ -198,55 +206,35 @@ max_treedepth = 10
 
             let dt = stepsize * directions[depth] as f64;
 
-            let i_prev = (depth_steps[0] as i32 - directions[depth]) as usize;
+            let mut q = qs.row(i_prev).to_owned();
+            let mut p = ps.row(i_prev).to_owned();
 
-            let mut q = qs[i_prev].clone();
-            let mut p = ps[i_prev].clone();
-
-            let (_, grad) = value_and_grad(&q);
+            let (_, qgrad) = Python::with_gil(|py| {
+                value_and_grad(py, &py_value_and_grad, &q)
+            });
+            let mut grad = qgrad;
 
             // Initialize pointer into checks list
             let mut check_i = 0;
 
-            // These are a bunch of temporaries to minimize numpy
-            // allocations during integration
-            //let mut p_half = vec![0; size];
-            let half_dt = dt / 2.0;
-            let mut half_dt_grad = Vec::from_iter(grad.iter().map(|x| x * half_dt));
-            let dt_diag_m_inv = Vec::from_iter(diag_m_inv.iter().map(|x| x * dt));
             let mut leapfrogs_taken = 0;
             for i in depth_steps.iter() {
                 // leapfrog step
                 leapfrogs_taken += 1;
 
-                // p_half = p - (dt / 2) * grad
-                for (pv, h) in itertools::izip!(&mut p, &half_dt_grad) {
-                    *pv -= h
-                }   // p here is actually p_half
-                // q = q + dt * numpy.dot(M_inv, p_half)
-                // q = q + dt * diag_M_inv * p_half
-                let zz = 1;
-                for (qv, h, pv) in itertools::izip!(&mut q, &dt_diag_m_inv, &p) {
-                    *qv += h * pv;
-                }
-
-                let (u, grad) = value_and_grad(&q);
-                half_dt_grad = Vec::from_iter(grad.iter().map(|x| x * half_dt));
-                // // p = p_half - (dt / 2) * grad
-                for (pv, h) in itertools::izip!(&mut p, &half_dt_grad) {
-                    *pv -= h;  // p here is indeed p
-                }
+                let p_half = p - (dt / 2.0) * grad;
+                q = q + dt * &diag_m_inv * &p_half;
+                let (u, qgrad) = Python::with_gil(|py| {
+                    value_and_grad(py, &py_value_and_grad, &q)
+                });
+                grad = qgrad;
+                p = p_half - (dt / 2.0) * &grad;
 
                 let k = kinetic_energy(&p, &diag_m_inv);
                 let h = k + u;
 
-                for (qvd, qv) in itertools::izip!(&mut qs[*i], &q) {
-                    *qvd = *qv;
-                }
-
-                for (pvd, pv) in itertools::izip!(&mut ps[*i], &p) {
-                    *pvd = *pv;
-                }
+                qs.row_mut(*i).assign(&q);
+                ps.row_mut(*i).assign(&p);
 
                 log_pi[*i] = -h;
 
@@ -258,10 +246,10 @@ max_treedepth = 10
                         let end_i = depth_steps[end];
     
                         let is_uturn = uturn(
-                            &qs[end_i],
-                            &qs[start_i],
-                            &ps[end_i],
-                            &ps[start_i],
+                            &qs.row(end_i),
+                            &qs.row(start_i),
+                            &ps.row(end_i),
+                            &ps.row(start_i),
                         );
     
                         if is_uturn {
@@ -280,8 +268,10 @@ max_treedepth = 10
                 }
             }
 
+            total_leapfrogs_taken += leapfrogs_taken;
+
             // Merging the two trees requires one more uturn check from the overall left to right states
-            let uturn_detected = uturn_detected_new_tree || uturn(&qs[i_right], &qs[i_left], &ps[i_right], &ps[i_left]);
+            let uturn_detected = uturn_detected_new_tree || uturn(&qs.row(i_right), &qs.row(i_left), &ps.row(i_right), &ps.row(i_left));
 
             // Accept statistic from ordinary HMC
             // Only compute the accept probability for the steps done
@@ -313,8 +303,6 @@ max_treedepth = 10
 
                 break
             }
-
-            let old_accept_stat = accept_stat;
 
             accept_stat = match accept_stat {
                 None => Some(p_tree_accept),
@@ -363,9 +351,21 @@ max_treedepth = 10
         }
 
         // Get the final sample
-        let q = qs[i_old].clone();
-            
-        Ok(())
-    })
-    //println!("Hello, world!");
+        q_ret.assign(&qs.row(i_old));
+    
+        // 0.0565, 0.313
+        //println!("{}", qs.row(i_old));
+    });
+
+    Ok(vec![
+        q_ret.into_pyarray(py).to_object(py),
+        accept_stat.unwrap().to_object(py),
+        total_leapfrogs_taken.to_object(py)
+    ])
+}
+
+#[pymodule]
+fn one_step(py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(do_it, m)?)?;
+    Ok(())
 }
